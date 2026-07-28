@@ -1,0 +1,25 @@
+{
+"type": "FeatureCollection",
+"name": "etiosa_places",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "element": "node", "id": 501330278, "name": "Sangotedo" }, "geometry": { "type": "Point", "coordinates": [ 3.635581, 6.471022 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501392258, "name": "Ogombo" }, "geometry": { "type": "Point", "coordinates": [ 3.6137358, 6.4503484 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501392560, "name": "Langbasa" }, "geometry": { "type": "Point", "coordinates": [ 3.5804701, 6.5072516 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501392682, "name": "Ikota" }, "geometry": { "type": "Point", "coordinates": [ 3.5495785, 6.4473305 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501432097, "name": "Ikate" }, "geometry": { "type": "Point", "coordinates": [ 3.4885399, 6.4292788 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501471396, "name": "Victoria Island" }, "geometry": { "type": "Point", "coordinates": [ 3.4259904, 6.4300279 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501483975, "name": "Ajah" }, "geometry": { "type": "Point", "coordinates": [ 3.5623861, 6.4694716 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501492354, "name": "Badore" }, "geometry": { "type": "Point", "coordinates": [ 3.6159537, 6.5099252 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501501091, "name": "Maroko" }, "geometry": { "type": "Point", "coordinates": [ 3.4551385, 6.4288783 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 501507968, "name": "Tarkwa" }, "geometry": { "type": "Point", "coordinates": [ 3.3938323, 6.4022662 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 5485534155, "name": "Victoria Garden City" }, "geometry": { "type": "Point", "coordinates": [ 3.5524253, 6.4644559 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 5777682236, "name": "Lekki Phase II" }, "geometry": { "type": "Point", "coordinates": [ 3.5781822, 6.4538491 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 5908615078, "name": "Ikoyi" }, "geometry": { "type": "Point", "coordinates": [ 3.4280523, 6.4523431 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 13235411954, "name": "Lekki Phase I" }, "geometry": { "type": "Point", "coordinates": [ 3.4704698, 6.4413987 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 13438579460, "name": "Jakande" }, "geometry": { "type": "Point", "coordinates": [ 3.5080182, 6.4344194 ] } },
+{ "type": "Feature", "properties": { "element": "node", "id": 13438579461, "name": "Okun-Ajah" }, "geometry": { "type": "Point", "coordinates": [ 3.5926861, 6.4270724 ] } },
+{ "type": "Feature", "properties": { "element": "way", "id": 375803555, "name": "Eko Atlantic" }, "geometry": { "type": "Point", "coordinates": [ 3.428668606460675, 6.414096130459384 ] } },
+{ "type": "Feature", "properties": { "element": "way", "id": 1020019238, "name": "Banana Island" }, "geometry": { "type": "Point", "coordinates": [ 3.456045133252076, 6.461727074412082 ] } }
+]
+}
