@@ -9,6 +9,28 @@ st.title("Eti-Osa Flood Risk")
 st.caption("Live, forecast-driven flood risk for Lekki, Ikoyi & Victoria Island, Lagos, Nigeria")
 
 risk_grid = gpd.read_file("data/etiosa_wall_flexure.geojson")
+road_risk = gpd.read_file("data/etiosa_road_risk.geojson")
+
+import ast
+
+def _flatten(value):
+    if isinstance(value, list):
+        return value[0] if len(value) > 0 else None
+    text = str(value).strip()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed[0]
+        except (ValueError, SyntaxError):
+            return text.strip("[]'\" ")
+    return value
+
+flooded_roads = road_risk[road_risk["flood_prone_today"]][
+    ["road_name", "area_name", "dynamic_risk_today", "flood_cause", "geometry"]
+].copy()
+flooded_roads["road_name"] = flooded_roads["road_name"].apply(_flatten).astype(str)
+flooded_roads["flood_cause"] = flooded_roads["flood_cause"].apply(_flatten).astype(str)
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -41,15 +63,69 @@ if selected_name != "(none selected)":
     map_center = [centroid.y, centroid.x]
     map_zoom = 15
 
+st.write("Map layers:")
+lcol1, lcol2, lcol3, lcol4 = st.columns(4)
+show_area = lcol1.checkbox("Area risk", value=True)
+show_roads = lcol2.checkbox("Flood-prone roads", value=True)
+show_drainage = lcol3.checkbox("Drainage channels", value=False)
+show_coastline = lcol4.checkbox("Lagoon / coastline", value=False)
+
 m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="CartoDB dark_matter")
-folium.GeoJson(
-    risk_grid.to_json(),
-    style_function=style_function,
-    tooltip=folium.GeoJsonTooltip(
-        fields=["area_name", "dynamic_risk_score", "forecast_rain_mm_tomorrow", "risk_tier"],
-        aliases=["Area:", "Risk score:", "Forecast rain (mm):", "Risk tier:"],
-    ),
-).add_to(m)
+
+if show_area:
+    folium.GeoJson(
+        risk_grid.to_json(),
+        style_function=style_function,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["area_name", "dynamic_risk_score", "forecast_rain_mm_tomorrow", "risk_tier"],
+            aliases=["Area:", "Risk score:", "Forecast rain (mm):", "Risk tier:"],
+        ),
+    ).add_to(m)
+
+if show_drainage:
+    drainage_lines = gpd.read_file("data/etiosa_drainage_lines.geojson")
+
+    def _dflatten(value):
+        return value[0] if isinstance(value, list) else value
+
+    if "name" in drainage_lines.columns:
+        drainage_lines = drainage_lines.copy()
+        drainage_lines["name"] = drainage_lines["name"].apply(_dflatten).astype(str)
+        drainage_lines.loc[drainage_lines["name"].isin(["None", "nan", ""]), "name"] = "Unnamed drain"
+
+    folium.GeoJson(
+        drainage_lines.to_json(),
+        style_function=lambda feature: {"color": "#00bfff", "weight": 1.8, "opacity": 0.8},
+        tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["Drainage:"]) if "name" in drainage_lines.columns else None,
+    ).add_to(m)
+
+if show_coastline:
+    drainage_polygons = gpd.read_file("data/etiosa_drainage_polygons.geojson")
+    TIDAL_WATER_NAMES = ["Lagos Lagoon", "Five Cowries Creek", "Commodore Channel"]
+    coastline = drainage_polygons[drainage_polygons["name"].isin(TIDAL_WATER_NAMES)]
+    folium.GeoJson(
+        coastline.to_json(),
+        style_function=lambda feature: {"fillColor": "#1f6feb", "color": "#1f6feb", "weight": 1, "fillOpacity": 0.25},
+        tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["Water body:"]),
+    ).add_to(m)
+
+if show_roads and len(flooded_roads) > 0:
+    flooded_geojson = flooded_roads.to_json()
+    road_tooltip = folium.GeoJsonTooltip(
+        fields=["road_name", "area_name", "dynamic_risk_today", "flood_cause"],
+        aliases=["Road:", "Area:", "Risk score:", "Likely cause:"],
+    )
+    # Soft red glow: a wide, faint underlayer plus a brighter core line,
+    # rather than a flat stripe.
+    folium.GeoJson(
+        flooded_geojson,
+        style_function=lambda feature: {"color": "#ff3333", "weight": 14, "opacity": 0.12},
+    ).add_to(m)
+    folium.GeoJson(
+        flooded_geojson,
+        style_function=lambda feature: {"color": "#ff3333", "weight": 4, "opacity": 0.75},
+        tooltip=road_tooltip,
+    ).add_to(m)
 
 if dropdown_area is not None:
     centroid = dropdown_area.geometry.centroid
