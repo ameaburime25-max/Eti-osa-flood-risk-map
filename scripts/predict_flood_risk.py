@@ -66,6 +66,16 @@ CELL_SIZE_M = 1000  # 1km x 1km grid cells
 RAIN_BASELINE = 0.3
 RAIN_SATURATION_MM = 50  # daily rainfall (mm) at which rainfall_factor maxes out
 
+# Calibrated against a real, documented event (the July 2024 Lekki/Ikoyi
+# flood): at 25mm/day and below, susceptibility differentiates risk as
+# before. Between 25-50mm/day, an additional "system-wide overwhelm" term
+# kicks in, reflecting that Lagos State's own reporting on these floods
+# blames overwhelmed/blocked drainage capacity everywhere, not just at
+# the least-susceptible spots -- extreme rain floods areas that a purely
+# relative susceptibility ranking would call "moderate."
+EXTREME_RAIN_MM = 25
+SEVERE_RAIN_MM = 50
+
 
 def require_file(path, produced_by):
     if not path.exists():
@@ -244,7 +254,9 @@ def compute_dynamic_risk(grid):
     rainfall_factor = np.clip(rain / RAIN_SATURATION_MM, 0, 1)
     susceptibility = grid["mean_susceptibility"].to_numpy()
 
-    dynamic_risk = susceptibility * (RAIN_BASELINE + (1 - RAIN_BASELINE) * rainfall_factor)
+    base_risk = susceptibility * (RAIN_BASELINE + (1 - RAIN_BASELINE) * rainfall_factor)
+    extreme_overwhelm = np.clip((rain - EXTREME_RAIN_MM) / (SEVERE_RAIN_MM - EXTREME_RAIN_MM), 0, 1)
+    dynamic_risk = 1 - (1 - base_risk) * (1 - extreme_overwhelm)
 
     grid = grid.copy()
     grid["dynamic_risk_score"] = dynamic_risk
