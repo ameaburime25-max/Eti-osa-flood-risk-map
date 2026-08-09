@@ -24,6 +24,7 @@ Output image: outputs/etiosa_terrain_buildings_roads.png
 import gzip
 import shutil
 from pathlib import Path
+import fabdem
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -131,83 +132,65 @@ def download_srtm_tile(tile_name):
 
 def build_dem(boundary_gdf):
     """
-    Figures out which SRTM tile(s) overlap the Eti-Osa boundary, downloads
-    them, mosaics them together if there's more than one (Eti-Osa's Lekki
-    peninsula can straddle two 1-degree tiles), then clips the result down
-    to just the Eti-Osa boundary polygon so we're not carrying extra data.
+    Downloads FABDEM (Forest And Buildings removed Copernicus GLO-30 DEM)
+    for the Eti-Osa bounding box, then clips it to just the Eti-Osa
+    boundary polygon.
+
+    FABDEM starts from the same Copernicus GLO-30 surface model, but has
+    building and tree height statistically removed via a trained
+    correction model (Hawker et al. 2022). This is the actual fix for
+    the "elevation reflects building/tree height, not bare ground" bias
+    that forced the hand-coded absolute elevation cutoff in the tidal
+    exposure logic earlier in this project -- bare-earth elevation
+    should make road/tidal risk scoring more accurate without that
+    workaround.
+
+    Source: Neal & Hawker (2023), University of Bristol
+    (https://doi.org/10.5523/bris.s5hqmjcdj8yo2ibzi9b4ew3sn), via the
+    `fabdem` package, which downloads only the tiles covering the
+    requested bounding box rather than the full ~300GB global archive.
+
+    Data license: CC BY-NC-SA 4.0 -- non-commercial use only. If this
+    project is ever monetized, this elevation layer would need a
+    commercial license (contact fabdem@fathom.global).
+
+    Requires: pip install fabdem
     """
     if DEM_MERGED_PATH.exists():
         print(f"DEM already exists at {DEM_MERGED_PATH}, skipping download.")
         return DEM_MERGED_PATH
 
     minx, miny, maxx, maxy = boundary_gdf.total_bounds
+    tmp_path = DATA_DIR / "_fabdem_mosaic_tmp.tif"
 
-    # Collect every 1-degree tile name touching the bounding box corners.
-    tile_names = set()
-    for lat in [miny, maxy]:
-        for lon in [minx, maxx]:
-            tile_names.add(srtm_tile_name(lat, lon))
+    print(f"Downloading FABDEM for bounds ({minx:.4f}, {miny:.4f}, {maxx:.4f}, {maxy:.4f}) ...")
+    fabdem.download(
+        (minx, miny, maxx, maxy),
+        output_path=str(tmp_path),
+        cache=DATA_DIR / "fabdem_cache",
+        show_progress=True,
+    )
 
-    print(f"Need SRTM tile(s): {sorted(tile_names)}")
-    hgt_paths = [download_srtm_tile(t) for t in sorted(tile_names)]
-
-    # rasterio.open() gives us a handle to read each raster file's data
-    # and metadata (its coordinate reference system, resolution, etc.)
-    src_files = [rasterio.open(p) for p in hgt_paths]
-
-    if len(src_files) > 1:
-        # merge() mosaics multiple raster tiles into a single array +
-        # a transform (the mapping from pixel row/col to real-world coords)
-        print("  Merging multiple SRTM tiles into one mosaic...")
-        mosaic_array, mosaic_transform = merge(src_files)
-        mosaic_crs = src_files[0].crs
-    else:
-        mosaic_array = src_files[0].read()
-        mosaic_transform = src_files[0].transform
-        mosaic_crs = src_files[0].crs
-
-    # Write the (possibly merged) raster to a proper GeoTIFF so downstream
-    # tools/scripts can just open one clean file.
-    profile = {
-        "driver": "GTiff",
-        "height": mosaic_array.shape[1],
-        "width": mosaic_array.shape[2],
-        "count": 1,
-        "dtype": mosaic_array.dtype,
-        "crs": mosaic_crs,
-        "transform": mosaic_transform,
-        "nodata": src_files[0].nodata,
-    }
-    tmp_path = DATA_DIR / "_mosaic_tmp.tif"
-    with rasterio.open(tmp_path, "w", **profile) as dst:
-        dst.write(mosaic_array)
-
-    for s in src_files:
-        s.close()
-
-    # rasterio.mask.mask() clips a raster to a vector polygon shape --
-    # here, the actual Eti-Osa LGA boundary -- instead of just a
-    # rectangular bounding box, so the DEM only covers the LGA itself.
+    # Clip to the actual Eti-Osa boundary polygon, same as the old SRTM
+    # path did -- fabdem.download() only gives us a rectangular bbox.
     print("  Clipping DEM to Eti-Osa boundary polygon...")
-    boundary_geom = boundary_gdf.to_crs(mosaic_crs).geometry
     with rasterio.open(tmp_path) as src:
+        mosaic_crs = src.crs
+        boundary_geom = boundary_gdf.to_crs(mosaic_crs).geometry
         clipped_array, clipped_transform = mask(src, boundary_geom, crop=True)
         clipped_profile = src.profile.copy()
 
-    clipped_profile.update(
-        {
-            "height": clipped_array.shape[1],
-            "width": clipped_array.shape[2],
-            "transform": clipped_transform,
-        }
-    )
+    clipped_profile.update({
+        "height": clipped_array.shape[1],
+        "width": clipped_array.shape[2],
+        "transform": clipped_transform,
+    })
     with rasterio.open(DEM_MERGED_PATH, "w", **clipped_profile) as dst:
         dst.write(clipped_array)
 
     tmp_path.unlink()
     print(f"  DEM saved to {DEM_MERGED_PATH}")
     return DEM_MERGED_PATH
-
 
 # ---------------------------------------------------------------------------
 # Step 3: Pull buildings and roads from OpenStreetMap with osmnx

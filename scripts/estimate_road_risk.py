@@ -208,6 +208,17 @@ def main():
     coastal_exposure = coastal_proximity * tidal_elevation_factor
     tomorrow_tide_m, tide_factor = fetch_tide_forecast()
     tidal_risk_today = coastal_exposure * tide_factor
+    # FABDEM samples bridges spanning open water at ~0m (the bare-earth
+    # correction has no real ground to reveal under an elevated deck, so
+    # it falls back to the surrounding water surface). That falsely
+    # triggers the tidal elevation cutoff. A bridge deck's flood risk is
+    # a structural clearance question, not a terrain one -- so use OSM's
+    # own bridge tag to exclude bridges from the tidal pathway directly,
+    # rather than trying to out-guess the DEM.
+    is_bridge = roads["bridge"].notna() & (roads["bridge"].astype(str).str.lower() != "no")
+    n_bridges = int(is_bridge.sum())
+    print(f"Excluding {n_bridges} bridge segment(s) from tidal risk (elevated structure, not ground)...")
+    tidal_risk_today = np.where(is_bridge.to_numpy(), 0.0, tidal_risk_today)
 
     rainfall_factor = np.clip(forecast_rain / RAIN_SATURATION_MM, 0, 1)
     dynamic_risk_today = susceptibility * (RAIN_BASELINE + (1 - RAIN_BASELINE) * rainfall_factor)
@@ -215,6 +226,7 @@ def main():
     flood_cause = np.where(tidal_risk_today > dynamic_risk_today, "tidal", "rainfall")
 
     roads = roads.copy()
+    roads["is_bridge"] = is_bridge
     roads["road_name"] = roads["name"].apply(clean_road_name)
     roads["elevation_m"] = elevation
     roads["dist_to_drainage_m"] = drainage_dist
@@ -234,7 +246,7 @@ def main():
             "road_name", "highway", "area_name", "elevation_m", "dist_to_drainage_m",
             "coastal_dist_m", "susceptibility", "forecast_rain_mm_tomorrow", "tomorrow_tide_m",
             "rainfall_risk_today", "tidal_risk_today", "dynamic_risk_today", "flood_cause",
-            "flood_prone_today", "geometry",
+            "flood_prone_today", "geometry","is_bridge",
         ]
     ]
     roads_out.to_file(OUT_PATH, driver="GeoJSON")
