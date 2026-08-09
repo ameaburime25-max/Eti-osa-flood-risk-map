@@ -1,10 +1,8 @@
 name: Daily Flood Risk Forecast
-
 on:
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch: {}
-
 jobs:
   update-forecast:
     runs-on: ubuntu-latest
@@ -13,22 +11,25 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run the forecast script
         run: python scripts/predict_flood_risk.py
-
+      - name: Compute wall flexural capacity
+        run: python scripts/estimate_wall_flexure.py
+      - name: Compute road-level and tidal risk
+        run: python scripts/estimate_road_risk.py
+      - name: Validate against historical flood record (sanity check, non-blocking)
+        run: python scripts/validate_against_history.py
+        continue-on-error: true
       - name: Commit and push updated forecast data
         run: |
           git config user.name "Flood Risk Bot"
           git config user.email "actions@github.com"
-          git add data/etiosa_dynamic_risk_grid.geojson
+          git add data/etiosa_dynamic_risk_grid.geojson data/etiosa_wall_flexure.geojson data/etiosa_road_risk.geojson
           git diff --staged --quiet || git commit -m "Daily forecast update: $(date -u +'%Y-%m-%d')"
           git push
