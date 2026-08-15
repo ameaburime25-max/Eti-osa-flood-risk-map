@@ -76,6 +76,21 @@ RAIN_SATURATION_MM = 50  # daily rainfall (mm) at which rainfall_factor maxes ou
 EXTREME_RAIN_MM = 25
 SEVERE_RAIN_MM = 50
 
+# Drainage- and evaporation-aware rain carryover (replaces a flat
+# yesterday+today sum -- see compute_dynamic_risk()). carryover_fraction
+# is how much of yesterday's rain is even still sitting there as standing
+# water rather than having already drained away, scaled by this cell's
+# own mean_effective_drainage_score (0 = excellent/unblocked drainage,
+# 1 = distant from any working drain -- see compute_flood_risk.py Section
+# 10 of MODEL_CHANGELOG.md). Whatever's still sitting there is then
+# reduced further by real ET0 (FAO-56 reference evapotranspiration,
+# mm/day, from Open-Meteo) -- the sun genuinely dries up shallow standing
+# water regardless of whether it was ever going to drain. Kept in sync
+# with the same constants in validate_against_history.py and
+# estimate_road_risk.py.
+MIN_CARRYOVER = 0.15
+MAX_CARRYOVER = 0.85
+
 
 def require_file(path, produced_by):
     if not path.exists():
@@ -122,9 +137,21 @@ def aggregate_risk_to_grid(grid, risk_buildings):
     buildings_m["geometry"] = buildings_m.geometry.centroid
 
     joined = gpd.sjoin(buildings_m, grid_m[["cell_id", "geometry"]], predicate="within")
+
+    # mean_effective_drainage_score (compute_flood_risk.py -- drainage
+    # proximity discounted by the nearest drain's blockage_risk) is
+    # aggregated here too, purely additive, so it's available for a
+    # drainage-aware rain carryover between days (see compute_dynamic_risk).
+    # Falls back to the older raw drainage_score if a stale
+    # etiosa_flood_risk.geojson without the blockage upgrade is in use.
+    drainage_col = "effective_drainage_score" if "effective_drainage_score" in buildings_m.columns else "drainage_score"
     agg = (
         joined.groupby("cell_id")
-        .agg(mean_susceptibility=("risk_score", "mean"), building_count=("risk_score", "size"))
+        .agg(
+            mean_susceptibility=("risk_score", "mean"),
+            mean_effective_drainage_score=(drainage_col, "mean"),
+            building_count=("risk_score", "size"),
+        )
         .reset_index()
     )
 
@@ -213,7 +240,7 @@ def fetch_rainfall_forecast(grid, batch_size=50):
     single midnight-to-midnight total can miss when the rain happens to
     straddle a day boundary.
     """
-    print("Fetching yesterday's, today's, and tomorrow's rainfall from Open-Meteo...")
+    print("Fetching yesterday's, today's, and tomorrow's rainfall (and ET0 evapotranspiration) from Open-Meteo...")
     # Centroid computed in meters, then reprojected back to WGS84 -- Open-
     # Meteo's API needs real lat/lon degrees, but the midpoint itself
     # should be found in a flat coordinate system, not directly in degrees.
@@ -224,6 +251,9 @@ def fetch_rainfall_forecast(grid, batch_size=50):
     yesterday_vals = [np.nan] * len(lats)
     today_forecasts = [np.nan] * len(lats)
     tomorrow_forecasts = [np.nan] * len(lats)
+    et0_yesterday_vals = [np.nan] * len(lats)
+    et0_today_vals = [np.nan] * len(lats)
+    et0_tomorrow_vals = [np.nan] * len(lats)
 
     for i in range(0, len(lats), batch_size):
         lat_batch = lats[i : i + batch_size]
@@ -233,7 +263,13 @@ def fetch_rainfall_forecast(grid, batch_size=50):
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat_param}&longitude={lon_param}"
-            "&daily=precipitation_sum&past_days=1&forecast_days=2&timezone=Africa%2FLagos"
+            # et0_fao_evapotranspiration: FAO-56 Penman-Monteith reference
+            # evapotranspiration (mm/day) -- a real, standard meteorological
+            # variable (temperature + wind + humidity + solar radiation),
+            # not a guessed constant. Fetched in the same batched call as
+            # rain, so no extra API cost.
+            "&daily=precipitation_sum,et0_fao_evapotranspiration"
+            "&past_days=1&forecast_days=2&timezone=Africa%2FLagos"
         )
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
@@ -243,13 +279,22 @@ def fetch_rainfall_forecast(grid, batch_size=50):
         # single object -- handle both.
         results = data if isinstance(data, list) else [data]
         for j, r in enumerate(results):
-            precip = r.get("daily", {}).get("precipitation_sum", [])
+            daily = r.get("daily", {})
+            precip = daily.get("precipitation_sum", [])
             yesterday_mm = precip[0] if len(precip) > 0 else np.nan
             today_mm = precip[1] if len(precip) > 1 else yesterday_mm
             tomorrow_mm = precip[2] if len(precip) > 2 else today_mm
             yesterday_vals[i + j] = yesterday_mm
             today_forecasts[i + j] = today_mm
             tomorrow_forecasts[i + j] = tomorrow_mm
+
+            et0 = daily.get("et0_fao_evapotranspiration", [])
+            et0_yesterday = et0[0] if len(et0) > 0 else np.nan
+            et0_today = et0[1] if len(et0) > 1 else et0_yesterday
+            et0_tomorrow = et0[2] if len(et0) > 2 else et0_today
+            et0_yesterday_vals[i + j] = et0_yesterday
+            et0_today_vals[i + j] = et0_today
+            et0_tomorrow_vals[i + j] = et0_tomorrow
 
     grid = grid.copy()
     n_missing = int(pd.isna(yesterday_vals).sum() + pd.isna(today_forecasts).sum() + pd.isna(tomorrow_forecasts).sum())
@@ -258,26 +303,66 @@ def fetch_rainfall_forecast(grid, batch_size=50):
     grid["rain_mm_yesterday"] = pd.Series(yesterday_vals).fillna(0).to_numpy()
     grid["forecast_rain_mm_today"] = pd.Series(today_forecasts).fillna(0).to_numpy()
     grid["forecast_rain_mm_tomorrow"] = pd.Series(tomorrow_forecasts).fillna(0).to_numpy()
+    # ET0 missing values fall back to a modest 3mm/day (a typical humid-
+    # tropical Lagos value) rather than 0, since treating missing ET0 as
+    # "no evaporation happened" would bias the carryover formula toward
+    # over-predicting standing water.
+    grid["et0_mm_yesterday"] = pd.Series(et0_yesterday_vals).fillna(3.0).to_numpy()
+    grid["et0_mm_today"] = pd.Series(et0_today_vals).fillna(3.0).to_numpy()
+    grid["et0_mm_tomorrow"] = pd.Series(et0_tomorrow_vals).fillna(3.0).to_numpy()
     return grid
 
 
 # ---------------------------------------------------------------------------
 # Step 5: Combine susceptibility + forecast into tomorrow's risk
 # ---------------------------------------------------------------------------
+def compute_carried_over_water(prev_rain_mm, prev_et0_mm, effective_drainage_score):
+    """
+    How much of a previous day's rain is still sitting as standing water
+    today, instead of a flat "just add it all" assumption. Two real loss
+    mechanisms, applied in sequence:
+      1. Drainage: only the fraction of yesterday's rain this specific
+         cell's own drainage COULDN'T clear stays behind as standing
+         water -- carryover_fraction scales with mean_effective_drainage_score
+         (0 = excellent drainage -> most of it actually left; 1 = blocked/
+         distant drainage -> most of it is still there).
+      2. Evaporation: whatever's still sitting there gets reduced further
+         by that day's real ET0 (FAO-56 reference evapotranspiration, mm)
+         -- the sun dries up shallow standing water regardless of whether
+         it was ever going to drain. Can't evaporate more than what's
+         actually there, hence the clip at 0.
+    """
+    carryover_fraction = MIN_CARRYOVER + (MAX_CARRYOVER - MIN_CARRYOVER) * effective_drainage_score
+    water_after_drainage = prev_rain_mm * carryover_fraction
+    water_after_evaporation = np.clip(water_after_drainage - prev_et0_mm, 0, None)
+    return water_after_evaporation
+
+
 def compute_dynamic_risk(grid):
-    print("Combining susceptibility with rolling 2-day rainfall into today's and tomorrow's risk scores...")
+    print("Combining susceptibility with drainage- and evaporation-aware rain carryover into today's and tomorrow's risk scores...")
     susceptibility = grid["mean_susceptibility"].to_numpy()
     grid = grid.copy()
 
-    # Rolling 2-day accumulated rain: today's risk uses yesterday+today,
-    # tomorrow's risk uses today+tomorrow. Backtested against the 2024
-    # Lekki/Ikoyi flood and the August 2025 Lekki corridor flood: a
-    # single calendar day's total missed 3 of 6 real reported-flood-day
-    # area checks (the rain had straddled a day boundary in the data),
-    # while the rolling 2-day sum caught 6 of 6 -- see MODEL_CHANGELOG.md.
+    # Effective 2-day rain: today's actual rain plus whatever of
+    # yesterday's rain is realistically still standing there once this
+    # cell's own drainage condition and real evaporation are both
+    # accounted for -- not a flat yesterday+today sum. A flat sum treats
+    # a well-drained street and a blocked-drain street identically, which
+    # doesn't match how standing water actually behaves. Column name kept
+    # as "rolling_2day_rain_mm_*" for backward compatibility with
+    # estimate_road_risk.py and app.py, which both read it -- see
+    # MODEL_CHANGELOG.md for the fuller writeup and the historical
+    # backtest comparing this against the older flat-sum version.
+    effective_drainage_score = grid["mean_effective_drainage_score"].to_numpy()
+    carried_from_yesterday = compute_carried_over_water(
+        grid["rain_mm_yesterday"].to_numpy(), grid["et0_mm_yesterday"].to_numpy(), effective_drainage_score
+    )
+    carried_from_today = compute_carried_over_water(
+        grid["forecast_rain_mm_today"].to_numpy(), grid["et0_mm_today"].to_numpy(), effective_drainage_score
+    )
     rolling_rain = {
-        "today": grid["rain_mm_yesterday"].to_numpy() + grid["forecast_rain_mm_today"].to_numpy(),
-        "tomorrow": grid["forecast_rain_mm_today"].to_numpy() + grid["forecast_rain_mm_tomorrow"].to_numpy(),
+        "today": grid["forecast_rain_mm_today"].to_numpy() + carried_from_yesterday,
+        "tomorrow": grid["forecast_rain_mm_tomorrow"].to_numpy() + carried_from_today,
     }
 
     for day in ["today", "tomorrow"]:

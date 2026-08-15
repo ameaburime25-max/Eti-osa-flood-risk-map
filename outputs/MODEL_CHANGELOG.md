@@ -129,10 +129,29 @@ If the nearest drain is essentially guaranteed clear (blockage_risk=0), this is 
 
 **Honest caveat:** blockage_risk is a plausibility-weighted proxy built from real OSM tags and real building density, not an observed blockage survey — there's no ground-truth "this specific drain was blocked on this specific date" dataset to validate it against directly. The weights (40/35/25 split, and the specific per-type vulnerability values) are a defensible starting calibration, not something backtested against a real blockage-driven flood event the way the rainfall model now is.
 
+## 11. Replacing the flat rolling-2-day rain sum with a drainage- and evaporation-aware carryover
+
+Section 9's flat rolling-2-day sum (`yesterday's rain + today's rain`) fixed a real bug but was itself a blunt instrument: it treats every location identically, silently assuming standing water from yesterday behaves the same on a well-drained planned estate as it does next to a blocked drain. A direct critique of this from real local knowledge of how these streets actually dry out prompted a proper fix.
+
+**New mechanism, two real physical loss pathways instead of one flat assumption:**
+
+```
+water_still_standing = yesterday's rain x carryover_fraction
+water_after_evaporation = max(0, water_still_standing - ET0)
+today's effective rain = today's rain + water_after_evaporation
+```
+
+- `carryover_fraction` = 0.15 to 0.85, scaled by that specific location's own `effective_drainage_score` (Section 10) -- a well-drained cell only carries ~15% of yesterday's rain forward (most of it genuinely left), a blocked/distant-drainage cell carries ~85% (it's still sitting there). Grid cells use their mean; roads use their own, more precise, per-road score.
+- `ET0` is real FAO-56 Penman-Monteith reference evapotranspiration (mm/day) -- a standard variable Open-Meteo publishes from temperature, wind, humidity and solar radiation, fetched in the same batched API call already being made for rain, at no extra cost. This is the correct term for what's colloquially "the sun drying up standing water" -- not condensation, which is a different, unrelated process (cloud/dew formation from water vapour, not relevant to floodwater loss).
+
+**Result:** backtested against both real events in Section 9's suite (3-way comparison: single-day, flat rolling-2-day, drainage+evaporation-aware carryover). On reported flood days: still 6/6, matching the flat sum exactly -- no regression. On a genuinely useful side-effect: on 26 June 2024, a lead-in day that was never reported as a flood day, the flat sum flagged all 3 tracked areas (Ikoyi, Lekki Phase I, Lekki Phase II) while the new carryover only flagged 1 (Lekki Phase II, the one with worse local drainage) -- a concrete sign this version is less prone to over-flagging days that weren't actually flood events, directly relevant to the still-open false-positive question (see Open limitations). Rolled into `predict_flood_risk.py` (grid-level, using `mean_effective_drainage_score`) and `estimate_road_risk.py` (road-level, using each road's own `effective_drainage_score` -- more precise than inheriting the grid's averaged number).
+
+**Honest caveat:** the 0.15/0.85 carryover bounds are a first, defensible calibration (ground never fully dries by morning, ground never fully retains 100% either), not a measured constant -- same status as the other thresholds in this project. It hasn't been tested against a full rainy season of ordinary multi-day rain sequences either, so its false-positive behaviour beyond the one lead-in day above is still mostly unverified.
+
 ## Open limitations (as of this entry)
 
-- Two historical rainfall-driven events have now been validated (2024, 2025), both scoring 3/3 on their reported flood day once rolling 2-day rain was introduced. Still just two events, and both are rain-driven — the tidal pathway has no validated event yet (see Section 9's October 2022 lead). More real, dated events (the HDX/NEMA flood datasets and the 1968-2020 Lagos flood inventory) would make the calibration more robust.
-- The rolling 2-day rain thresholds are reused from single-day calibration and haven't been checked against a full season of ordinary (non-extreme) rain for false positives -- see Section 9.
+- Two historical rainfall-driven events have now been validated (2024, 2025), both scoring 3/3 on their reported flood day once rolling 2-day rain was introduced (Section 9), and the drainage+evaporation-aware carryover (Section 11) matches that 6/6 with better lead-in-day selectivity. Still just two events, and both are rain-driven — the tidal pathway has no validated event yet (see Section 9's October 2022 lead). More real, dated events (the HDX/NEMA flood datasets and the 1968-2020 Lagos flood inventory) would make the calibration more robust.
+- The rain-carryover thresholds (`EXTREME_RAIN_MM`/`SEVERE_RAIN_MM`, and now `MIN_CARRYOVER`/`MAX_CARRYOVER`) are first, defensible calibrations, not measured constants, and haven't been checked against a full season of ordinary (non-extreme) rain for false positives -- see Sections 9 and 11.
 - Drainage blockage (Section 10) is now modeled from real waterway type, culvert status, and building encroachment — a real upgrade from pure distance — but it's a physically-reasoned proxy, not validated against an observed blockage event, since no such dataset exists for Eti-Osa.
 - Culverts and smaller water crossings that aren't tagged `bridge=yes` in OpenStreetMap could still carry the same DEM artifact found in Section 7 — worth spot-checking if more false positives turn up at other water crossings.
 - Open-Meteo's own documentation notes `sea_level_height_msl` accuracy is "limited in coastal areas" and "may be completely unreliable further inland" — a real, honest caveat on the entire tidal pathway regardless of the calibration fix in Section 8. Its historical archive also doesn't actually serve this variable at all, on any model tested (Section 9), so tidal validation will need a different data source (a real Lagos tide gauge record, or an astronomical/harmonic tide prediction model) rather than Open-Meteo.

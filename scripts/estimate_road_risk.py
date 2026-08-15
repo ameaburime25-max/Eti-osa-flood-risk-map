@@ -66,6 +66,15 @@ RAIN_SATURATION_MM = 50
 EXTREME_RAIN_MM = 25
 SEVERE_RAIN_MM = 50
 
+# Drainage- and evaporation-aware rain carryover -- same idea and same
+# constants as predict_flood_risk.py, but computed here using each ROAD's
+# own effective_drainage_score (more precise than the grid cell's
+# averaged version) rather than inheriting a neighborhood-level number.
+# See predict_flood_risk.py's compute_carried_over_water() for the full
+# rationale.
+MIN_CARRYOVER = 0.15
+MAX_CARRYOVER = 0.85
+
 # Real named tidal waterways in Eti-Osa (from data/etiosa_drainage_polygons.geojson) --
 # these are the only water bodies actually connected to the ocean/lagoon tide, as
 # opposed to small inland drainage ponds/canals.
@@ -227,17 +236,21 @@ def clean_road_name(value):
 
 def attach_forecast_rain(roads, midpoints, grid):
     """
-    Pulls both the raw single-day rain (for display) and the rolling
-    2-day accumulated rain (for the actual risk calculation) from each
-    road's nearest grid cell -- see predict_flood_risk.py for why the
-    rolling sum is what drives risk now.
+    Pulls each road's nearest grid cell's raw rain (today/tomorrow, for
+    display) plus yesterday's rain and ET0 evapotranspiration (yesterday/
+    today) -- rain, sun, and wind genuinely don't vary street-to-street
+    the way drainage does, so inheriting these from the nearest 1km grid
+    cell is the same simplification already used for the raw rain
+    forecast. The actual 2-day carryover is then computed per-road in
+    main() using each road's OWN effective_drainage_score, not the grid
+    cell's averaged one.
     """
-    print("Matching each road to its grid cell's rain forecast (today and tomorrow)...")
+    print("Matching each road to its grid cell's rain forecast and ET0 (today and tomorrow)...")
     points_gdf = gpd.GeoDataFrame(geometry=midpoints, crs=roads.crs).to_crs(METRIC_CRS)
     grid_m = grid.to_crs(METRIC_CRS)[
         [
             "area_name", "forecast_rain_mm_today", "forecast_rain_mm_tomorrow",
-            "rolling_2day_rain_mm_today", "rolling_2day_rain_mm_tomorrow", "geometry",
+            "rain_mm_yesterday", "et0_mm_yesterday", "et0_mm_today", "geometry",
         ]
     ]
     joined = gpd.sjoin_nearest(points_gdf, grid_m, distance_col="_dist")
@@ -246,8 +259,9 @@ def attach_forecast_rain(roads, midpoints, grid):
         joined["area_name"].to_numpy(),
         joined["forecast_rain_mm_today"].to_numpy(),
         joined["forecast_rain_mm_tomorrow"].to_numpy(),
-        joined["rolling_2day_rain_mm_today"].to_numpy(),
-        joined["rolling_2day_rain_mm_tomorrow"].to_numpy(),
+        joined["rain_mm_yesterday"].to_numpy(),
+        joined["et0_mm_yesterday"].to_numpy(),
+        joined["et0_mm_today"].to_numpy(),
     )
 
 
@@ -273,8 +287,19 @@ def main():
     )
     (
         area_name, forecast_rain_today, forecast_rain_tomorrow,
-        rolling_rain_today, rolling_rain_tomorrow,
+        rain_yesterday, et0_yesterday, et0_today,
     ) = attach_forecast_rain(roads, midpoints, grid)
+
+    # Drainage- and evaporation-aware carryover, computed per-road using
+    # each road's OWN effective_drainage_score (see
+    # predict_flood_risk.py's compute_carried_over_water() for the
+    # rationale -- same formula, applied at higher spatial resolution
+    # here since roads already have their own drainage signal).
+    carryover_fraction = MIN_CARRYOVER + (MAX_CARRYOVER - MIN_CARRYOVER) * effective_drainage_score
+    carried_from_yesterday = np.clip(rain_yesterday * carryover_fraction - et0_yesterday, 0, None)
+    carried_from_today = np.clip(forecast_rain_today * carryover_fraction - et0_today, 0, None)
+    rolling_rain_today = forecast_rain_today + carried_from_yesterday
+    rolling_rain_tomorrow = forecast_rain_tomorrow + carried_from_today
 
     tidal_water = identify_tidal_water(drainage_polygons)
     coastal_dist, coastal_proximity = compute_coastal_exposure(midpoints, tidal_water)

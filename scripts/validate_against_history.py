@@ -31,6 +31,21 @@ METRIC_CRS = "EPSG:32631"
 RAIN_BASELINE = 0.3
 RAIN_SATURATION_MM = 50
 
+# Drainage-aware rain carryover -- tests a real critique of the flat
+# rolling-2-day sum: a flat yesterday+today total treats every location
+# the same, but standing water from yesterday's rain should linger
+# longer somewhere with bad/blocked drainage than somewhere that clears
+# fast. carryover_fraction is how much of yesterday's rain still counts
+# today, scaled by that cell's own mean_effective_drainage_score (0 =
+# excellent, unblocked drainage; 1 = distant from any working drain).
+# MIN_CARRYOVER isn't 0 even for the best-drained cells -- some ground
+# saturation/minor ponding persists overnight regardless. MAX_CARRYOVER
+# isn't 1 even for the worst -- some water is always lost to evaporation
+# and slow infiltration, just much less of it. Both are a first,
+# testable calibration, not measured constants.
+MIN_CARRYOVER = 0.15
+MAX_CARRYOVER = 0.85
+
 # Real, dated, sourced rainfall-driven flood events affecting Eti-Osa.
 # Only rain-driven events are here -- the tidal pathway has no equivalent
 # historical dataset available (see MODEL_CHANGELOG.md Section 7/8), so
@@ -68,16 +83,21 @@ EVENTS = [
 
 def fetch_historical_rain(grid, dates, batch_size=50):
     """
-    Fetches real historical daily rain covering `dates`, padded one extra
-    day earlier, so a rolling 2-day rainfall sum (today + yesterday) can
-    be computed for every requested date -- including the first one.
+    Fetches real historical daily rain AND ET0 evapotranspiration
+    covering `dates`, padded one extra day earlier, so a 2-day carryover
+    (today + some of yesterday) can be computed for every requested date
+    -- including the first one.
 
-    This tests a hypothesis raised by the backtest results: daily-
-    resolution data can split one continuous multi-day rain event across
-    a calendar boundary, so the single day the news reports as "the
-    flood day" doesn't always line up with the single day the data shows
-    the most rain (see MODEL_CHANGELOG.md). A rolling 2-day sum should be
-    less sensitive to exactly which side of midnight the rain landed on.
+    Three candidates get compared per date: single-day rain, a flat
+    rolling-2-day sum (today + yesterday, validated 6/6 -- see
+    MODEL_CHANGELOG.md Section 9), and a drainage- and evaporation-aware
+    carryover (today + whatever of yesterday's rain this cell's own
+    drainage condition couldn't clear, minus real ET0 evaporation for
+    that day -- Section 10/11). The flat sum was itself a fix for daily-
+    resolution data splitting one continuous rain event across a
+    calendar boundary; this tests whether making the carryover
+    location-aware (instead of a uniform assumption for every cell) does
+    even better without losing that fix.
     """
     earliest = _date.fromisoformat(min(dates))
     latest = _date.fromisoformat(max(dates))
@@ -91,6 +111,7 @@ def fetch_historical_rain(grid, dates, batch_size=50):
     lons = [pt.x for pt in centroids]
 
     daily_rain = {}
+    daily_et0 = {}
 
     for i in range(0, len(lats), batch_size):
         lat_batch = lats[i : i + batch_size]
@@ -101,26 +122,55 @@ def fetch_historical_rain(grid, dates, batch_size=50):
             "https://archive-api.open-meteo.com/v1/archive"
             f"?latitude={lat_param}&longitude={lon_param}"
             f"&start_date={padded_start}&end_date={padded_end}"
-            "&daily=precipitation_sum&timezone=Africa%2FLagos"
+            # et0_fao_evapotranspiration: real FAO-56 reference
+            # evapotranspiration (mm/day), fetched in the same call as
+            # rain -- see predict_flood_risk.py's compute_carried_over_water()
+            # for how it's used to reduce carried-over standing water.
+            "&daily=precipitation_sum,et0_fao_evapotranspiration&timezone=Africa%2FLagos"
         )
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         results = data if isinstance(data, list) else [data]
         for j, r in enumerate(results):
-            times = r.get("daily", {}).get("time", [])
-            precip = r.get("daily", {}).get("precipitation_sum", [])
-            for d, p in zip(times, precip):
-                daily_rain.setdefault(d, [np.nan] * len(lats))[i + j] = p
+            daily = r.get("daily", {})
+            times = daily.get("time", [])
+            precip = daily.get("precipitation_sum", [])
+            et0 = daily.get("et0_fao_evapotranspiration", [])
+            for idx, d in enumerate(times):
+                daily_rain.setdefault(d, [np.nan] * len(lats))[i + j] = precip[idx] if idx < len(precip) else np.nan
+                daily_et0.setdefault(d, [np.nan] * len(lats))[i + j] = et0[idx] if idx < len(et0) else np.nan
 
     for d, values in daily_rain.items():
         grid[f"rain_{d}"] = values
+    for d, values in daily_et0.items():
+        # Same fallback used in predict_flood_risk.py: missing ET0
+        # treated as a modest 3mm/day rather than 0, so a gap in the
+        # historical archive doesn't silently turn off evaporation.
+        grid[f"et0_{d}"] = pd.Series(values).fillna(3.0).to_numpy()
+
+    if "mean_effective_drainage_score" in grid.columns:
+        carryover_fraction = MIN_CARRYOVER + (MAX_CARRYOVER - MIN_CARRYOVER) * grid[
+            "mean_effective_drainage_score"
+        ].fillna(0)
+    else:
+        print("  (no mean_effective_drainage_score in grid -- re-run predict_flood_risk.py to enable "
+              "the drainage-aware carryover test; falling back to a flat 0.5 carryover for now.)")
+        carryover_fraction = pd.Series(0.5, index=grid.index)
 
     for d in dates:
         prev = (_date.fromisoformat(d) - _timedelta(days=1)).isoformat()
         today_col = grid[f"rain_{d}"].fillna(0) if f"rain_{d}" in grid.columns else 0
         prev_col = grid[f"rain_{prev}"].fillna(0) if f"rain_{prev}" in grid.columns else 0
+        prev_et0_col = grid[f"et0_{prev}"] if f"et0_{prev}" in grid.columns else 3.0
+        # Flat rolling-2-day sum (currently in production, validated 6/6).
         grid[f"rain2d_{d}"] = today_col + prev_col
+        # Drainage- and evaporation-aware carryover candidate: only part
+        # of yesterday's rain counts today (scaled by that cell's own
+        # drainage condition), and whatever's left is reduced further by
+        # real ET0 evaporation for that day.
+        carried = np.clip(prev_col * carryover_fraction - prev_et0_col, 0, None)
+        grid[f"raincarry_{d}"] = today_col + carried
 
     return grid
 
@@ -145,6 +195,7 @@ def main():
 
     peak_correct_1d = 0
     peak_correct_2d = 0
+    peak_correct_carry = 0
     peak_total = 0
 
     for event in EVENTS:
@@ -157,8 +208,10 @@ def main():
             is_peak = date in event["peak_dates"]
             risk_1d, tier_1d = compute_historical_risk(grid, f"rain_{date}")
             risk_2d, tier_2d = compute_historical_risk(grid, f"rain2d_{date}")
+            risk_carry, tier_carry = compute_historical_risk(grid, f"raincarry_{date}")
             grid[f"risk_{date}"] = risk_1d
             grid[f"risk2d_{date}"] = risk_2d
+            grid[f"riskcarry_{date}"] = risk_carry
 
             tag = " (REPORTED FLOOD DAY)" if is_peak else " (context/lead-in day)"
             print(f"\nDate: {date}{tag}")
@@ -166,24 +219,34 @@ def main():
             summary = subset.groupby("area_name").agg(
                 real_rain_1d_mm=(f"rain_{date}", "mean"),
                 real_rain_2d_mm=(f"rain2d_{date}", "mean"),
+                real_rain_carry_mm=(f"raincarry_{date}", "mean"),
                 model_risk_1d=(f"risk_{date}", "mean"),
                 model_risk_2d=(f"risk2d_{date}", "mean"),
+                model_risk_carry=(f"riskcarry_{date}", "mean"),
             )
             for area, row in summary.iterrows():
                 flagged_1d = row["model_risk_1d"] >= 0.5
                 flagged_2d = row["model_risk_2d"] >= 0.5
+                flagged_carry = row["model_risk_carry"] >= 0.5
                 if is_peak:
                     peak_total += 1
                     peak_correct_1d += int(flagged_1d)
                     peak_correct_2d += int(flagged_2d)
+                    peak_correct_carry += int(flagged_carry)
                 status_1d = "FLAGGED" if flagged_1d else "missed"
                 status_2d = "FLAGGED" if flagged_2d else "missed"
+                status_carry = "FLAGGED" if flagged_carry else "missed"
                 print(
-                    f"  {area:<20} 1-day rain={row['real_rain_1d_mm']:5.1f}mm -> risk={row['model_risk_1d']:.2f} [{status_1d}]"
-                    f"   |   2-day rain={row['real_rain_2d_mm']:5.1f}mm -> risk={row['model_risk_2d']:.2f} [{status_2d}]"
+                    f"  {area:<20} 1-day={row['real_rain_1d_mm']:5.1f}mm->risk={row['model_risk_1d']:.2f}[{status_1d}]"
+                    f"  |  flat 2-day={row['real_rain_2d_mm']:5.1f}mm->risk={row['model_risk_2d']:.2f}[{status_2d}]"
+                    f"  |  drainage-aware carryover={row['real_rain_carry_mm']:5.1f}mm->risk={row['model_risk_carry']:.2f}[{status_carry}]"
                 )
 
-    print(f"\n=== ON REPORTED FLOOD DAYS ONLY: single-day = {peak_correct_1d}/{peak_total}, rolling 2-day = {peak_correct_2d}/{peak_total} ===")
+    print(
+        f"\n=== ON REPORTED FLOOD DAYS ONLY: single-day = {peak_correct_1d}/{peak_total}, "
+        f"flat rolling 2-day = {peak_correct_2d}/{peak_total}, "
+        f"drainage-aware carryover = {peak_correct_carry}/{peak_total} ==="
+    )
     print("-------------------------------------------")
 
 
