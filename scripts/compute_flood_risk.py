@@ -20,10 +20,19 @@ Requires (from earlier scripts):
   data/etiosa_buildings.geojson    (build_basemap.py, now caches to disk)
   data/etiosa_boundary.geojson     (build_basemap.py)
   data/etiosa_drainage_lines.geojson (get_drainage.py)
+  data/etiosa_drainage_blockage.geojson (model_drainage_blockage.py)
 
 Run with: python scripts/compute_flood_risk.py
 Output: outputs/etiosa_flood_risk_map.png
 Also saves: data/etiosa_flood_risk.geojson (every building + its score)
+
+--- v2: drainage blockage ---
+distance-to-drain on its own silently assumes every mapped drain is
+clear and working. model_drainage_blockage.py scores every real drainage
+segment with a blockage_risk (0-1) from waterway type, culvert/tunnel
+status, and real building-encroachment pressure. Here, that's blended
+into an "effective" drainage score: being close to a drain only helps if
+that drain isn't blocked (see compute_effective_drainage_score() below).
 """
 
 from pathlib import Path
@@ -42,6 +51,7 @@ DEM_PATH = DATA_DIR / "etiosa_dem.tif"
 BUILDINGS_PATH = DATA_DIR / "etiosa_buildings.geojson"
 BOUNDARY_PATH = DATA_DIR / "etiosa_boundary.geojson"
 DRAINAGE_LINES_PATH = DATA_DIR / "etiosa_drainage_lines.geojson"
+DRAINAGE_BLOCKAGE_PATH = DATA_DIR / "etiosa_drainage_blockage.geojson"
 
 # UTM zone 31N -- flat, meters-based coordinate system for this part of
 # Lagos. Distances/areas are only meaningful once you're off lat/lon
@@ -77,13 +87,15 @@ def load_inputs():
     require_file(BUILDINGS_PATH, "build_basemap.py (with the buildings-caching update)")
     require_file(BOUNDARY_PATH, "build_basemap.py")
     require_file(DRAINAGE_LINES_PATH, "get_drainage.py")
+    require_file(DRAINAGE_BLOCKAGE_PATH, "model_drainage_blockage.py")
 
-    print("Loading cached buildings, boundary, and drainage lines...")
+    print("Loading cached buildings, boundary, drainage lines, and drainage blockage scores...")
     buildings = gpd.read_file(BUILDINGS_PATH)
     boundary = gpd.read_file(BOUNDARY_PATH)
     drainage_lines = gpd.read_file(DRAINAGE_LINES_PATH)
+    drainage_blockage = gpd.read_file(DRAINAGE_BLOCKAGE_PATH)
     print(f"  {len(buildings)} buildings, {len(drainage_lines)} drainage line features.")
-    return buildings, boundary, drainage_lines
+    return buildings, boundary, drainage_lines, drainage_blockage
 
 
 def sample_elevation(buildings):
@@ -145,10 +157,49 @@ def compute_drainage_distance(buildings, drainage_lines):
     return buildings
 
 
+def attach_nearest_drain_blockage(buildings, drainage_blockage):
+    """
+    For every building, finds its single nearest drainage LINE segment
+    (not ponds/canals as polygons -- this project's blockage_risk is
+    specifically about conveyance channels) and reads off that segment's
+    blockage_risk (model_drainage_blockage.py). This is deliberately the
+    SAME nearest-neighbour match as compute_drainage_distance() above --
+    the drain that's closest is the one whose condition actually matters
+    to this building.
+    """
+    print("Attaching each building's nearest drain's blockage_risk...")
+    buildings_m = buildings.to_crs(METRIC_CRS).reset_index(drop=True)
+    buildings_m["_bid"] = buildings_m.index
+    blockage_m = drainage_blockage.to_crs(METRIC_CRS)[["blockage_risk", "geometry"]]
+
+    joined = gpd.sjoin_nearest(buildings_m, blockage_m, distance_col="_dist")
+    joined = joined.drop_duplicates(subset="_bid").sort_values("_bid")
+
+    buildings = buildings.copy()
+    buildings["blockage_risk_nearest_drain"] = joined["blockage_risk"].to_numpy()
+    return buildings
+
+
+def compute_effective_drainage_score(drainage_score, blockage_risk):
+    """
+    Being close to a drain only helps if that drain still works. This
+    blends the raw distance-based drainage_score with the nearest drain's
+    blockage_risk: if the nearest drain is essentially guaranteed clear
+    (blockage_risk=0), the effective score is unchanged from the raw
+    distance score. If the nearest drain is essentially guaranteed
+    blocked (blockage_risk=1), the effective score gets pushed all the
+    way to 1 (worst case) regardless of how close it is -- i.e. treated
+    as if there were no working drain nearby at all. In between, the
+    proximity benefit is discounted proportionally to how likely that
+    drain is to actually be blocked.
+    """
+    return drainage_score + (1 - drainage_score) * blockage_risk
+
+
 def compute_risk_score(buildings):
     """
-    Turns the two raw signals (elevation in meters, distance in meters)
-    into one 0-1 risk score:
+    Turns the raw signals (elevation in meters, distance in meters,
+    nearest-drain blockage_risk) into one 0-1 risk score:
       - elevation_score: uses the 5th-95th percentile of elevation as the
         "full scale" (not the true min/max, which can be an SRTM noise
         artifact) -- 1.0 at or below the 5th percentile (lowest, riskiest
@@ -157,8 +208,12 @@ def compute_risk_score(buildings):
       - drainage_score: 0.0 right next to a drain, 1.0 at or beyond the
         95th-percentile distance (same outlier-capping idea, applied to
         distance instead of elevation).
-      - risk_score: a weighted blend of the two (see ELEVATION_WEIGHT /
-        DRAINAGE_WEIGHT at the top of this file).
+      - effective_drainage_score: drainage_score discounted (or not) by
+        the nearest drain's blockage_risk -- see
+        compute_effective_drainage_score() above.
+      - risk_score: a weighted blend of elevation_score and
+        effective_drainage_score (see ELEVATION_WEIGHT / DRAINAGE_WEIGHT
+        at the top of this file).
     """
     print("Computing composite risk scores...")
     elev = buildings["elevation_m"].to_numpy()
@@ -171,11 +226,15 @@ def compute_risk_score(buildings):
     dist_cap = np.quantile(dist, DRAINAGE_DISTANCE_CAP_PERCENTILE)
     drainage_score = np.clip(dist / dist_cap, 0, 1)
 
-    risk_score = ELEVATION_WEIGHT * elevation_score + DRAINAGE_WEIGHT * drainage_score
+    blockage_risk = buildings["blockage_risk_nearest_drain"].to_numpy()
+    effective_drainage_score = compute_effective_drainage_score(drainage_score, blockage_risk)
+
+    risk_score = ELEVATION_WEIGHT * elevation_score + DRAINAGE_WEIGHT * effective_drainage_score
 
     buildings = buildings.copy()
     buildings["elevation_score"] = elevation_score
     buildings["drainage_score"] = drainage_score
+    buildings["effective_drainage_score"] = effective_drainage_score
     buildings["risk_score"] = risk_score
     buildings["risk_tier"] = pd_cut_risk(risk_score)
     return buildings
@@ -253,6 +312,11 @@ def print_sanity_checks(buildings):
         f"max={buildings['dist_to_drain_m'].max():.0f}m, "
         f"mean={buildings['dist_to_drain_m'].mean():.0f}m"
     )
+    print(
+        f"Nearest-drain blockage_risk: mean={buildings['blockage_risk_nearest_drain'].mean():.2f}, "
+        f"buildings with blockage_risk >= 0.7: "
+        f"{(buildings['blockage_risk_nearest_drain'] >= 0.7).sum()} / {len(buildings)}"
+    )
     print("\nRisk tier breakdown:")
     print(buildings["risk_tier"].value_counts().sort_index())
     print("\nTop 10 highest-risk buildings (centroid coordinates):")
@@ -264,16 +328,21 @@ def print_sanity_checks(buildings):
 
 
 def main():
-    buildings, boundary, drainage_lines = load_inputs()
+    buildings, boundary, drainage_lines, drainage_blockage = load_inputs()
     buildings = sample_elevation(buildings)
     buildings = compute_drainage_distance(buildings, drainage_lines)
+    buildings = attach_nearest_drain_blockage(buildings, drainage_blockage)
     buildings = compute_risk_score(buildings)
 
     out_geojson = DATA_DIR / "etiosa_flood_risk.geojson"
     save_cols = [
         c
         for c in buildings.columns
-        if c in ("geometry", "elevation_m", "dist_to_drain_m", "elevation_score", "drainage_score", "risk_score", "risk_tier")
+        if c in (
+            "geometry", "elevation_m", "dist_to_drain_m", "elevation_score",
+            "blockage_risk_nearest_drain", "drainage_score", "effective_drainage_score",
+            "risk_score", "risk_tier",
+        )
     ]
     buildings_to_save = buildings[save_cols].copy()
     buildings_to_save["risk_tier"] = buildings_to_save["risk_tier"].astype(str)

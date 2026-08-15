@@ -18,10 +18,18 @@ Requires:
   data/etiosa_roads.geojson (build_basemap.py)
   data/etiosa_dem.tif (build_basemap.py)
   data/etiosa_drainage_lines.geojson, etiosa_drainage_polygons.geojson (get_drainage.py)
+  data/etiosa_drainage_blockage.geojson (model_drainage_blockage.py)
   data/etiosa_dynamic_risk_grid.geojson (predict_flood_risk.py)
 
 Run with: python scripts/estimate_road_risk.py
 Saves: data/etiosa_road_risk.geojson
+
+--- v2: drainage blockage ---
+Same idea as compute_flood_risk.py: distance to the nearest drainage
+feature doesn't know whether that drain is actually clear. Each road's
+susceptibility now also discounts drainage proximity by the nearest
+drainage LINE's blockage_risk (model_drainage_blockage.py) -- see
+compute_susceptibility() below.
 """
 
 from pathlib import Path
@@ -41,6 +49,7 @@ ROADS_PATH = DATA_DIR / "etiosa_roads.geojson"
 DEM_PATH = DATA_DIR / "etiosa_dem.tif"
 DRAINAGE_LINES_PATH = DATA_DIR / "etiosa_drainage_lines.geojson"
 DRAINAGE_POLYGONS_PATH = DATA_DIR / "etiosa_drainage_polygons.geojson"
+DRAINAGE_BLOCKAGE_PATH = DATA_DIR / "etiosa_drainage_blockage.geojson"
 GRID_PATH = DATA_DIR / "etiosa_dynamic_risk_grid.geojson"
 OUT_PATH = DATA_DIR / "etiosa_road_risk.geojson"
 
@@ -106,13 +115,36 @@ def compute_drainage_distance(midpoints, drainage_lines, drainage_polygons):
     return joined["dist_to_drainage_m"].to_numpy()
 
 
-def compute_susceptibility(elevation, drainage_dist):
+def compute_nearest_drain_blockage(midpoints, drainage_blockage):
+    """
+    For every road, finds its nearest drainage LINE segment (not the
+    ponds/creeks in drainage_polygons -- blockage_risk is specifically
+    about conveyance channels) and reads off that segment's blockage_risk
+    (model_drainage_blockage.py). Same nearest-neighbour logic as
+    compute_flood_risk.py's building version.
+    """
+    print("Attaching each road's nearest drain's blockage_risk...")
+    points_gdf = gpd.GeoDataFrame(geometry=midpoints).to_crs(METRIC_CRS)
+    blockage_m = drainage_blockage.to_crs(METRIC_CRS)[["blockage_risk", "geometry"]]
+    joined = gpd.sjoin_nearest(points_gdf, blockage_m, distance_col="_dist")
+    joined = joined[~joined.index.duplicated(keep="first")]
+    return joined["blockage_risk"].to_numpy()
+
+
+def compute_susceptibility(elevation, drainage_dist, blockage_risk):
+    """
+    blockage_risk discounts how much benefit drainage proximity provides
+    -- being close to a drain only helps if that drain isn't blocked. See
+    compute_flood_risk.py's compute_effective_drainage_score() for the
+    same formula and its rationale.
+    """
     elev_low, elev_high = np.quantile(elevation, 0.05), np.quantile(elevation, 0.95)
     elevation_score = np.clip(1 - (elevation - elev_low) / (elev_high - elev_low), 0, 1)
     dist_cap = np.quantile(drainage_dist, 0.95)
     drainage_score = np.clip(drainage_dist / dist_cap, 0, 1)
-    susceptibility = 0.6 * elevation_score + 0.4 * drainage_score
-    return susceptibility, elevation_score
+    effective_drainage_score = drainage_score + (1 - drainage_score) * blockage_risk
+    susceptibility = 0.6 * elevation_score + 0.4 * effective_drainage_score
+    return susceptibility, elevation_score, drainage_score, effective_drainage_score
 
 
 def identify_tidal_water(drainage_polygons):
@@ -224,16 +256,21 @@ def main():
     require_file(DEM_PATH, "build_basemap.py")
     require_file(DRAINAGE_LINES_PATH, "get_drainage.py")
     require_file(DRAINAGE_POLYGONS_PATH, "get_drainage.py")
+    require_file(DRAINAGE_BLOCKAGE_PATH, "model_drainage_blockage.py")
     require_file(GRID_PATH, "predict_flood_risk.py")
 
     roads = gpd.read_file(ROADS_PATH)
     drainage_lines = gpd.read_file(DRAINAGE_LINES_PATH)
     drainage_polygons = gpd.read_file(DRAINAGE_POLYGONS_PATH)
+    drainage_blockage = gpd.read_file(DRAINAGE_BLOCKAGE_PATH)
     grid = gpd.read_file(GRID_PATH)
 
     elevation, midpoints = sample_elevation(roads, DEM_PATH)
     drainage_dist = compute_drainage_distance(midpoints, drainage_lines, drainage_polygons)
-    susceptibility, elevation_score = compute_susceptibility(elevation, drainage_dist)
+    blockage_risk = compute_nearest_drain_blockage(midpoints, drainage_blockage)
+    susceptibility, elevation_score, drainage_score, effective_drainage_score = compute_susceptibility(
+        elevation, drainage_dist, blockage_risk
+    )
     (
         area_name, forecast_rain_today, forecast_rain_tomorrow,
         rolling_rain_today, rolling_rain_tomorrow,
@@ -266,6 +303,8 @@ def main():
     roads["road_name"] = roads["name"].apply(clean_road_name)
     roads["elevation_m"] = elevation
     roads["dist_to_drainage_m"] = drainage_dist
+    roads["blockage_risk_nearest_drain"] = blockage_risk
+    roads["effective_drainage_score"] = effective_drainage_score
     roads["coastal_dist_m"] = coastal_dist
     roads["susceptibility"] = susceptibility
     roads["area_name"] = area_name
@@ -305,6 +344,7 @@ def main():
     roads_out = roads[
         [
             "road_name", "highway", "area_name", "elevation_m", "dist_to_drainage_m",
+            "blockage_risk_nearest_drain", "effective_drainage_score",
             "coastal_dist_m", "susceptibility", "is_bridge",
             "forecast_rain_mm_today", "forecast_rain_mm_tomorrow",
             "rolling_2day_rain_mm_today", "rolling_2day_rain_mm_tomorrow",

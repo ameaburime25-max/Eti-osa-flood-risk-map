@@ -105,10 +105,34 @@ A user checked their own house (Banana Island) against the map and found it flag
 
 **Honest caveat:** the rolling 2-day sum is now being run through thresholds (`EXTREME_RAIN_MM`/`SEVERE_RAIN_MM` = 25mm/50mm) that were originally calibrated against single-day totals. Both known events validate cleanly under this reuse, and the lead-in days in both events (6.6mm and 22.2mm 2-day totals for 2024, 3.8mm and 14.3mm for 2025) correctly stayed low — but this hasn't been checked against a full rainy season of ordinary, non-flood 2-day rain sequences, so the false-positive rate on typical (non-extreme) two-day wet spells is still unverified.
 
+## 10. Drainage blockage modeling — human-caused, not just distance
+
+Every version up to this point modeled drainage as pure geometry: distance to the nearest mapped channel, silently assuming that channel is clear and working. That's not how Lagos actually floods. Lagos State runs a standing Emergency Flood Abatement Gang specifically to "free up manholes and blackspots" (the Commissioner's own words, Oct 2022 Nairametrics) because real drains get choked with refuse, silt, and informal encroachment — a building 20m from a fully blocked drain has the same practical drainage as a building 20m from no drain at all.
+
+**New script: `scripts/model_drainage_blockage.py`.** Scores every one of the 546 real OSM drainage-line segments in Eti-Osa with a `blockage_risk` (0-1), from three independent, physically-grounded signals actually present in the data:
+
+- **Waterway type.** `drain` (426 segments) and `ditch` (90) are small, shallow, artificial channels — exactly what a bag of refuse or a load of construction sand can choke solid. `canal`/`river`/`stream` (9/4/17) carry real continuous flow and are far harder to fully block by informal dumping. Weighted 40% of the score.
+- **Culvert/tunnel status.** 218 of 546 segments (40%) are tagged `tunnel=culvert` — covered/underground drainage. A blocked culvert is invisible from street level and can't be manually cleared the way an open channel can; that opacity is a real vulnerability independent of channel size. Fixed bonus, weighted 25%.
+- **Building encroachment pressure.** Using the real 73,101-footprint building dataset, counts buildings within 15m of each segment, normalized per 100m of segment length. Dense building pressure right on a drain is a direct proxy for the two real human causes of blockage: informal structures built into the drainage right-of-way, and population density making dumping into the nearest open channel the path of least resistance. Weighted 35%.
+
+Result: mean blockage_risk by type came out exactly as the physical reasoning predicts — drain 0.48 > ditch 0.37 > stream 0.19 > canal 0.12 > river 0.08 — without that ordering being hard-coded anywhere; it falls straight out of combining the three independent signals.
+
+**Integration: "proximity only helps if the drain still works."** Rather than bolting blockage_risk on as a fourth independent weighted term (which would double-count distance and blockage as if they were unrelated), it's blended directly into the existing drainage_score in both `compute_flood_risk.py` (buildings) and `estimate_road_risk.py` (roads):
+
+```
+effective_drainage_score = drainage_score + (1 - drainage_score) * blockage_risk
+```
+
+If the nearest drain is essentially guaranteed clear (blockage_risk=0), this is identical to the old distance-only score. If the nearest drain is essentially guaranteed blocked (blockage_risk=1), the effective score is pushed to 1 (worst case) regardless of how close it is — treated as if there were no working drain nearby at all. In between, the proximity benefit is discounted proportionally. `risk_score` (buildings) and `susceptibility` (roads) now use this effective score in place of the raw one; the raw `drainage_score` and `blockage_risk_nearest_drain` are kept as separate columns for transparency.
+
+**Result on the real data:** 207 of 73,101 buildings have a nearest drain with blockage_risk ≥ 0.7. Re-ran the full pipeline including the 6-event historical backtest from Section 9: still 6/6 on reported flood days — blockage risk shifts susceptibility at the individual building/road level (via the effective drainage score) without regressing the events already validated. On this particular forecast day, the top-flagged roads stayed dominated by tidal risk in low-lying Ajah (tide_factor was already 1.00, so `max(rainfall_risk, tidal_risk)` was already saturated there regardless of drainage blockage) — blockage's effect will show up more clearly on rain-dominated days and in the underlying susceptibility ranking than in today's specific flagged-road count.
+
+**Honest caveat:** blockage_risk is a plausibility-weighted proxy built from real OSM tags and real building density, not an observed blockage survey — there's no ground-truth "this specific drain was blocked on this specific date" dataset to validate it against directly. The weights (40/35/25 split, and the specific per-type vulnerability values) are a defensible starting calibration, not something backtested against a real blockage-driven flood event the way the rainfall model now is.
+
 ## Open limitations (as of this entry)
 
 - Two historical rainfall-driven events have now been validated (2024, 2025), both scoring 3/3 on their reported flood day once rolling 2-day rain was introduced. Still just two events, and both are rain-driven — the tidal pathway has no validated event yet (see Section 9's October 2022 lead). More real, dated events (the HDX/NEMA flood datasets and the 1968-2020 Lagos flood inventory) would make the calibration more robust.
 - The rolling 2-day rain thresholds are reused from single-day calibration and haven't been checked against a full season of ordinary (non-extreme) rain for false positives -- see Section 9.
-- Drainage "capacity" is still modeled only as distance to the nearest mapped channel, not the channel's actual size, condition, or blockage status — which real government sources identify as a primary cause of these floods.
+- Drainage blockage (Section 10) is now modeled from real waterway type, culvert status, and building encroachment — a real upgrade from pure distance — but it's a physically-reasoned proxy, not validated against an observed blockage event, since no such dataset exists for Eti-Osa.
 - Culverts and smaller water crossings that aren't tagged `bridge=yes` in OpenStreetMap could still carry the same DEM artifact found in Section 7 — worth spot-checking if more false positives turn up at other water crossings.
 - Open-Meteo's own documentation notes `sea_level_height_msl` accuracy is "limited in coastal areas" and "may be completely unreliable further inland" — a real, honest caveat on the entire tidal pathway regardless of the calibration fix in Section 8. Its historical archive also doesn't actually serve this variable at all, on any model tested (Section 9), so tidal validation will need a different data source (a real Lagos tide gauge record, or an astronomical/harmonic tide prediction model) rather than Open-Meteo.
