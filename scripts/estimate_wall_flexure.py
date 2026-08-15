@@ -153,16 +153,26 @@ def compute_wall_flexure(grid):
         grid[col] = values
 
     # Live check: estimate today's likely flood depth from the model's own
-    # forecast-driven risk score, capped at the same 1.5m upper bound used
-    # elsewhere in this project (grounded in real reported Lagos flooding
-    # events) -- then see how close that puts each real area to its own
-    # cracking point, today.
-    grid["estimated_depth_m_today"] = grid["dynamic_risk_score"] * 1.5
+    # risk score, capped at the same 1.5m upper bound used elsewhere in
+    # this project (grounded in real reported Lagos flooding events) --
+    # then see how close that puts each real area to its own cracking
+    # point, today. dynamic_risk_score_today was previously just
+    # "dynamic_risk_score", which silently held TOMORROW's forecast value
+    # under a "today" label -- a real bug, caught when a user's own house
+    # showed flood risk while it was actually dry outside. Also compute
+    # the same check for tomorrow, for the today/tomorrow map toggle.
+    grid["estimated_depth_m_today"] = grid["dynamic_risk_score_today"] * 1.5
+    grid["estimated_depth_m_tomorrow"] = grid["dynamic_risk_score_tomorrow"] * 1.5
     grid["live_flexural_fos"] = [
         flexural_fos(depth, WALL_SPECS[typology])
         for typology, depth in zip(grid["construction_typology"], grid["estimated_depth_m_today"])
     ]
+    grid["live_flexural_fos_tomorrow"] = [
+        flexural_fos(depth, WALL_SPECS[typology])
+        for typology, depth in zip(grid["construction_typology"], grid["estimated_depth_m_tomorrow"])
+    ]
     grid["margin_to_failure_m"] = grid["critical_failure_depth_m"] - grid["estimated_depth_m_today"]
+    grid["margin_to_failure_m_tomorrow"] = grid["critical_failure_depth_m"] - grid["estimated_depth_m_tomorrow"]
 
     return grid
 

@@ -201,10 +201,19 @@ def fetch_rainfall_forecast(grid, batch_size=50):
     latitudes/longitudes in one request and returns one forecast per
     coordinate -- so instead of one HTTP request per grid cell, this
     batches many cells into each call. 'daily=precipitation_sum' with
-    forecast_days=2 returns a 2-value list per location: [today's total
-    rain, tomorrow's total rain] in millimeters -- we want index 1.
+    past_days=1&forecast_days=2 returns a 3-value list per location:
+    [yesterday's actual rain, today's rain, tomorrow's forecast rain] in
+    millimeters.
+
+    Yesterday's rain is fetched (a change from the previous 2-value
+    today/tomorrow-only version) so a rolling 2-day accumulated rainfall
+    total can be computed downstream -- validated against two real
+    historical flood events (see MODEL_CHANGELOG.md) to catch flooding
+    driven by rain accumulating over more than one calendar day, which a
+    single midnight-to-midnight total can miss when the rain happens to
+    straddle a day boundary.
     """
-    print("Fetching tomorrow's rainfall forecast from Open-Meteo...")
+    print("Fetching yesterday's, today's, and tomorrow's rainfall from Open-Meteo...")
     # Centroid computed in meters, then reprojected back to WGS84 -- Open-
     # Meteo's API needs real lat/lon degrees, but the midpoint itself
     # should be found in a flat coordinate system, not directly in degrees.
@@ -212,7 +221,9 @@ def fetch_rainfall_forecast(grid, batch_size=50):
     centroids = gpd.GeoSeries(centroids_metric, crs=METRIC_CRS).to_crs(grid.crs)
     lats = [pt.y for pt in centroids]
     lons = [pt.x for pt in centroids]
-    forecasts = [np.nan] * len(lats)
+    yesterday_vals = [np.nan] * len(lats)
+    today_forecasts = [np.nan] * len(lats)
+    tomorrow_forecasts = [np.nan] * len(lats)
 
     for i in range(0, len(lats), batch_size):
         lat_batch = lats[i : i + batch_size]
@@ -222,7 +233,7 @@ def fetch_rainfall_forecast(grid, batch_size=50):
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat_param}&longitude={lon_param}"
-            "&daily=precipitation_sum&forecast_days=2&timezone=Africa%2FLagos"
+            "&daily=precipitation_sum&past_days=1&forecast_days=2&timezone=Africa%2FLagos"
         )
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
@@ -233,15 +244,20 @@ def fetch_rainfall_forecast(grid, batch_size=50):
         results = data if isinstance(data, list) else [data]
         for j, r in enumerate(results):
             precip = r.get("daily", {}).get("precipitation_sum", [])
-            tomorrow_mm = precip[1] if len(precip) > 1 else (precip[0] if precip else np.nan)
-            forecasts[i + j] = tomorrow_mm
+            yesterday_mm = precip[0] if len(precip) > 0 else np.nan
+            today_mm = precip[1] if len(precip) > 1 else yesterday_mm
+            tomorrow_mm = precip[2] if len(precip) > 2 else today_mm
+            yesterday_vals[i + j] = yesterday_mm
+            today_forecasts[i + j] = today_mm
+            tomorrow_forecasts[i + j] = tomorrow_mm
 
     grid = grid.copy()
-    grid["forecast_rain_mm_tomorrow"] = forecasts
-    n_missing = pd.isna(grid["forecast_rain_mm_tomorrow"]).sum()
+    n_missing = int(pd.isna(yesterday_vals).sum() + pd.isna(today_forecasts).sum() + pd.isna(tomorrow_forecasts).sum())
     if n_missing:
-        print(f"  {n_missing} cells got no forecast value; treating as 0mm.")
-    grid["forecast_rain_mm_tomorrow"] = grid["forecast_rain_mm_tomorrow"].fillna(0)
+        print(f"  {n_missing} cell-day rainfall value(s) missing; treated as 0mm.")
+    grid["rain_mm_yesterday"] = pd.Series(yesterday_vals).fillna(0).to_numpy()
+    grid["forecast_rain_mm_today"] = pd.Series(today_forecasts).fillna(0).to_numpy()
+    grid["forecast_rain_mm_tomorrow"] = pd.Series(tomorrow_forecasts).fillna(0).to_numpy()
     return grid
 
 
@@ -249,20 +265,40 @@ def fetch_rainfall_forecast(grid, batch_size=50):
 # Step 5: Combine susceptibility + forecast into tomorrow's risk
 # ---------------------------------------------------------------------------
 def compute_dynamic_risk(grid):
-    print("Combining susceptibility with forecast rainfall into tomorrow's risk score...")
-    rain = grid["forecast_rain_mm_tomorrow"].to_numpy()
-    rainfall_factor = np.clip(rain / RAIN_SATURATION_MM, 0, 1)
+    print("Combining susceptibility with rolling 2-day rainfall into today's and tomorrow's risk scores...")
     susceptibility = grid["mean_susceptibility"].to_numpy()
-
-    base_risk = susceptibility * (RAIN_BASELINE + (1 - RAIN_BASELINE) * rainfall_factor)
-    extreme_overwhelm = np.clip((rain - EXTREME_RAIN_MM) / (SEVERE_RAIN_MM - EXTREME_RAIN_MM), 0, 1)
-    dynamic_risk = 1 - (1 - base_risk) * (1 - extreme_overwhelm)
-
     grid = grid.copy()
-    grid["dynamic_risk_score"] = dynamic_risk
-    grid["risk_tier"] = pd.cut(
-        dynamic_risk, bins=[-0.01, 0.25, 0.5, 0.75, 1.01], labels=["Low", "Medium", "High", "Very High"]
-    )
+
+    # Rolling 2-day accumulated rain: today's risk uses yesterday+today,
+    # tomorrow's risk uses today+tomorrow. Backtested against the 2024
+    # Lekki/Ikoyi flood and the August 2025 Lekki corridor flood: a
+    # single calendar day's total missed 3 of 6 real reported-flood-day
+    # area checks (the rain had straddled a day boundary in the data),
+    # while the rolling 2-day sum caught 6 of 6 -- see MODEL_CHANGELOG.md.
+    rolling_rain = {
+        "today": grid["rain_mm_yesterday"].to_numpy() + grid["forecast_rain_mm_today"].to_numpy(),
+        "tomorrow": grid["forecast_rain_mm_today"].to_numpy() + grid["forecast_rain_mm_tomorrow"].to_numpy(),
+    }
+
+    for day in ["today", "tomorrow"]:
+        rain = rolling_rain[day]
+        rainfall_factor = np.clip(rain / RAIN_SATURATION_MM, 0, 1)
+        base_risk = susceptibility * (RAIN_BASELINE + (1 - RAIN_BASELINE) * rainfall_factor)
+        extreme_overwhelm = np.clip((rain - EXTREME_RAIN_MM) / (SEVERE_RAIN_MM - EXTREME_RAIN_MM), 0, 1)
+        dynamic_risk = 1 - (1 - base_risk) * (1 - extreme_overwhelm)
+        grid[f"rolling_2day_rain_mm_{day}"] = rain
+        grid[f"dynamic_risk_score_{day}"] = dynamic_risk
+        grid[f"risk_tier_{day}"] = pd.cut(
+            dynamic_risk, bins=[-0.01, 0.25, 0.5, 0.75, 1.01], labels=["Low", "Medium", "High", "Very High"]
+        )
+
+    # Backward-compatible alias: the bare (unsuffixed) name now correctly
+    # means TODAY. This used to silently hold TOMORROW's value under a
+    # "today" label everywhere it was read downstream (estimate_wall_flexure.py's
+    # "today" live check, in particular) -- that mislabeling was a real bug,
+    # caught when a user's own house showed flood risk while dry outside.
+    grid["dynamic_risk_score"] = grid["dynamic_risk_score_today"]
+    grid["risk_tier"] = grid["risk_tier_today"]
     return grid
 
 
@@ -273,7 +309,7 @@ def plot_forecast_map(grid, boundary_gdf, forecast_date):
     fig, ax = plt.subplots(figsize=(12, 12))
 
     grid.plot(
-        column="dynamic_risk_score",
+        column="dynamic_risk_score_tomorrow",
         cmap="RdYlGn_r",
         ax=ax,
         edgecolor="white",
@@ -290,7 +326,7 @@ def plot_forecast_map(grid, boundary_gdf, forecast_date):
     # with a small pointer arrow (alternating up/down) rather than
     # stamping text directly on the cell, so labels for adjacent
     # high-risk cells don't overlap each other.
-    top5 = grid.nlargest(5, "dynamic_risk_score")
+    top5 = grid.nlargest(5, "dynamic_risk_score_tomorrow")
     for i, (_, row) in enumerate(top5.iterrows()):
         c = row.geometry.centroid
         y_offset = 25 if i % 2 == 0 else -25
@@ -325,14 +361,14 @@ def print_report(grid, forecast_date):
         f"mean={grid['forecast_rain_mm_tomorrow'].mean():.1f}mm"
     )
     print("\nRisk tier breakdown:")
-    print(grid["risk_tier"].value_counts().sort_index())
+    print(grid["risk_tier_tomorrow"].value_counts().sort_index())
 
     print(f"\nTop 10 areas to watch for {forecast_date.isoformat()}:")
-    top10 = grid.nlargest(10, "dynamic_risk_score")
+    top10 = grid.nlargest(10, "dynamic_risk_score_tomorrow")
     for _, row in top10.iterrows():
         print(
-            f"  {row['area_name']:<30} risk={row['dynamic_risk_score']:.2f} "
-            f"({row['risk_tier']})  forecast_rain={row['forecast_rain_mm_tomorrow']:.1f}mm  "
+            f"  {row['area_name']:<30} risk={row['dynamic_risk_score_tomorrow']:.2f} "
+            f"({row['risk_tier_tomorrow']})  forecast_rain={row['forecast_rain_mm_tomorrow']:.1f}mm  "
             f"susceptibility={row['mean_susceptibility']:.2f}"
         )
     print("-----------------------------------------------")
@@ -356,6 +392,8 @@ def main():
 
     grid_to_save = grid.drop(columns=["cell_id"])
     grid_to_save["risk_tier"] = grid_to_save["risk_tier"].astype(str)
+    grid_to_save["risk_tier_today"] = grid_to_save["risk_tier_today"].astype(str)
+    grid_to_save["risk_tier_tomorrow"] = grid_to_save["risk_tier_tomorrow"].astype(str)
     grid_to_save.to_file(GRID_OUT_PATH, driver="GeoJSON")
     print(f"Dynamic risk grid saved to {GRID_OUT_PATH}")
 
