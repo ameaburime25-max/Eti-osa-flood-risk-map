@@ -117,7 +117,7 @@ with map_menu_col:
         show_coastline = st.checkbox("Lagoon / coastline", value=False)
 st.caption("Click on map")
 
-m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="CartoDB dark_matter")
+m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="OpenStreetMap")
 
 if show_area:
     folium.GeoJson(
