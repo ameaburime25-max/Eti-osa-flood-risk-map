@@ -4,6 +4,9 @@ __pycache__/
 .DS_Store
 data/*.hgt
 data/*.tif
+# etiosa_dem.tif IS needed by the daily GitHub Actions workflow
+# (estimate_road_risk.py samples elevation from it) -- everything else
+# under data/*.tif (old SRTM tiles, FABDEM mosaic temp files) stays ignored.
+!data/etiosa_dem.tif
 data/etiosa_buildings.geojson
-data/etiosa_roads.geojson
 cache/
